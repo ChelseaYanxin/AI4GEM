@@ -5,6 +5,7 @@ import torch
 import math
 import argparse
 import matplotlib.pyplot as plt
+from io import BytesIO
 
 proj_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 src_path = os.path.join(proj_root, "src")
@@ -47,6 +48,20 @@ parser.add_argument('--triptych', action='store_true')
 parser.add_argument('--cmap', type=str, default=None)
 parser.add_argument('--unitE', type=str, default='a.u.')
 parser.add_argument('--unitH', type=str, default='a.u.')
+parser.add_argument('--backend', type=str, choices=['dense','gnn'], default='dense')
+parser.add_argument('--max-steps', type=int, default=None)
+parser.add_argument('--source', type=str, choices=['auto','none','gauss','cw'], default='auto')
+parser.add_argument('--src-steps', type=int, default=50)
+parser.add_argument('--src-amp', type=float, default=1.0)
+parser.add_argument('--src-freq-ghz', type=float, default=5.0)
+parser.add_argument('--gif', action='store_true', help='Export an Ez animation GIF')
+parser.add_argument('--gif-path', type=str, default='Ez_anim.gif', help='Output path for GIF (relative to project root if not absolute)')
+parser.add_argument('--gif-every', type=int, default=1, help='Capture every k steps')
+parser.add_argument('--gif-fps', type=int, default=15, help='Frames per second for GIF')
+parser.add_argument('--gif-hx', action='store_true', help='Also export an Hx GIF')
+parser.add_argument('--gif-hy', action='store_true', help='Also export an Hy GIF')
+parser.add_argument('--gif-hx-path', type=str, default='Hx_anim.gif', help='Output path for Hx GIF (relative to project root if not absolute)')
+parser.add_argument('--gif-hy-path', type=str, default='Hy_anim.gif', help='Output path for Hy GIF (relative to project root if not absolute)')
 args, _ = parser.parse_known_args()
 
 # find .mat under data/data_FDTD_2D_cavity if not provided
@@ -162,7 +177,13 @@ c0 = 299792458.0
 dt = float(args.cfl_scale) / (c0 * math.sqrt((1/dx**2) + (1/dz**2)))
 print("dt =", dt)
 
-model = GEMTE(dx=dx, dz=dz, dt=dt, eps=eps_t, mu=mu_t, sigma=sigma_t).to(device)
+if args.backend == 'dense':
+    model = GEMTE(dx=dx, dz=dz, dt=dt, eps=eps_t, mu=mu_t, sigma=sigma_t).to(device)
+else:
+    # lazy import to avoid hard dependency when not used
+    from gem.gem_te_gnn import GEMTEGraph2D
+    model = GEMTEGraph2D(nx=nx, ny=nz, dx=dx, dy=dz, dt=dt, eps=eps_t, mu=mu_t, sigma=sigma_t).to(device)
+print(f"Backend: {args.backend}")
 
 # sanity shapes
 assert Ez_t.dim()==4 and Hx_t.dim()==4 and Hy_t.dim()==4, (Ez_t.shape, Hx_t.shape, Hy_t.shape)
@@ -209,8 +230,34 @@ elif t is not None:
     steps = int(t.numel()) if torch.is_tensor(t) else int(len(t))
 else:
     steps = 200
+if args.max_steps is not None:
+    steps = min(steps, int(args.max_steps))
 snapshots = []
+# collect frames for optional GIF
+gif_frames = []          # Ez frames
+gif_hx_frames = []       # Hx frames
+gif_hy_frames = []       # Hy frames
+
+# source injection strategy
+cx, cy = nx//2, nz//2
+initial_peak = float(torch.max(torch.abs(Ez_t)).item())
+src_mode = args.source
+if args.source == 'auto':
+    src_mode = 'gauss' if initial_peak < 1e-9 else 'none'
+freq_hz = float(args.src_freq_ghz) * 1e9
+print(f"Source mode: {src_mode} (initial |Ez| max={initial_peak:.3e}) at center=({cx},{cy})")
 for n in range(steps):
+    # Optional source on Ez
+    if src_mode == 'gauss':
+        t0 = args.src_steps * 0.5
+        spread = max(1.0, args.src_steps * 0.2)
+        env = math.exp(-0.5 * ((n - t0)/spread)**2)
+        Ez_t[0,0,cx,cy] = Ez_t[0,0,cx,cy] + float(args.src_amp) * float(env)
+    elif src_mode == 'cw':
+        ramp = min(1.0, n / max(1, args.src_steps))
+        s = math.sin(2.0 * math.pi * freq_hz * (n * dt))
+        Ez_t[0,0,cx,cy] = Ez_t[0,0,cx,cy] + float(args.src_amp) * ramp * float(s)
+
     Ez_t, Hx_t, Hy_t = model.step(Ez_t, Hx_t, Hy_t)
     Ez_t = enforce_dirichlet_indices(Ez_t, idx_bc, nx, nz)
     Hx_t = enforce_dirichlet_indices(Hx_t, None, nx, nz)
@@ -228,6 +275,14 @@ for n in range(steps):
         nmean = float(torch.mean(arr_cur_t).item())
         nonzero = int((arr_cur_t != 0).sum().item())
         print(f"step {n}: min={nmin:.3e} max={nmax:.3e} mean={nmean:.3e} nonzero={nonzero}")
+    # collect GIF frames
+    if (n % max(1, int(args.gif_every)) == 0):
+        if args.gif:
+            gif_frames.append(arr_cur_t.clone())
+        if args.gif_hx:
+            gif_hx_frames.append(Hx_t[0,0].detach().cpu().clone())
+        if args.gif_hy:
+            gif_hy_frames.append(Hy_t[0,0].detach().cpu().clone())
 
 # final stats (torch)
 arr_t = Ez_t[0,0].detach().cpu()
@@ -372,3 +427,100 @@ plot_field(Hy_t, 'Hy', os.path.join(proj_root, 'Hy_snapshot.png'), mode=args.nor
 
 if args.triptych:
     plot_triptych(Ez_t, Hx_t, Hy_t, mode=args.norm, cmapE=args.cmap, cmapH=args.cmap, unitE=args.unitE, unitH=args.unitH, out_png=os.path.join(proj_root, 'figure1_debug_side_by_side.png'), percent_pair=percent_pair, share_scale=args.share_scale)
+
+# Optional: export GIF of Ez
+def _render_tensor_to_pil(ft2d: torch.Tensor, vmin: float, vmax: float, extent, cmap: str|None, title: str|None=None):
+    try:
+        from PIL import Image
+    except Exception:
+        return None
+    cm = cmap if cmap is not None else ('turbo' if args.norm in ('sym','percentile') else 'viridis')
+    fig = plt.figure(figsize=(4,3))
+    plt.imshow(ft2d.transpose(0,1).tolist(), origin='lower', cmap=cm, extent=extent, aspect='equal', vmin=vmin, vmax=vmax)
+    if title:
+        plt.title(title)
+    plt.axis('off')
+    buf = BytesIO()
+    plt.savefig(buf, format='png', bbox_inches='tight', pad_inches=0)
+    plt.close(fig)
+    buf.seek(0)
+    try:
+        from PIL import Image
+        img = Image.open(buf).convert('P', palette=Image.ADAPTIVE)
+        return img
+    except Exception:
+        return None
+
+if args.gif and gif_frames:
+    # extent in mm
+    x_mm_t = x.squeeze().detach().cpu() * 1e3
+    y_mm_t = y.squeeze().detach().cpu() * 1e3
+    extent = [float(x_mm_t.min().item()), float(x_mm_t.max().item()), float(y_mm_t.min().item()), float(y_mm_t.max().item())]
+
+    # global scaling to avoid flicker
+    stack = torch.stack([torch.nan_to_num(f) for f in gif_frames], dim=0)
+    vmin_g, vmax_g, _ = _compute_scale(stack, args.norm, percent_pair)
+    if args.norm == 'sym':
+        vmax_abs = max(abs(vmin_g), abs(vmax_g), 1e-12)
+        vmin_g, vmax_g = -vmax_abs, vmax_abs
+
+    pil_frames = []
+    for i, ft in enumerate(gif_frames):
+        img = _render_tensor_to_pil(torch.nan_to_num(ft), vmin_g, vmax_g, extent, args.cmap, None)
+        if img is not None:
+            pil_frames.append(img)
+    if pil_frames:
+        out_gif = args.gif_path
+        if not os.path.isabs(out_gif):
+            out_gif = os.path.join(proj_root, out_gif)
+        
+        pil_frames[0].save(out_gif, save_all=True, append_images=pil_frames[1:], duration=int(1000/max(1,args.gif_fps)), loop=0, disposal=2)
+        print(f"Saved GIF to {out_gif} ({len(pil_frames)} frames)")
+
+# Optional: export Hx GIF
+if args.gif_hx and gif_hx_frames:
+    x_mm_t = x.squeeze().detach().cpu() * 1e3
+    y_mm_t = y.squeeze().detach().cpu() * 1e3
+    extent = [float(x_mm_t.min().item()), float(x_mm_t.max().item()), float(y_mm_t.min().item()), float(y_mm_t.max().item())]
+
+    stack_hx = torch.stack([torch.nan_to_num(f) for f in gif_hx_frames], dim=0)
+    vmin_hx, vmax_hx, _ = _compute_scale(stack_hx, args.norm, percent_pair)
+    if args.norm == 'sym':
+        vmax_abs = max(abs(vmin_hx), abs(vmax_hx), 1e-12)
+        vmin_hx, vmax_hx = -vmax_abs, vmax_abs
+
+    pil_frames = []
+    for ft in gif_hx_frames:
+        img = _render_tensor_to_pil(torch.nan_to_num(ft), vmin_hx, vmax_hx, extent, args.cmap, None)
+        if img is not None:
+            pil_frames.append(img)
+    if pil_frames:
+        out_gif = args.gif_hx_path
+        if not os.path.isabs(out_gif):
+            out_gif = os.path.join(proj_root, out_gif)
+        pil_frames[0].save(out_gif, save_all=True, append_images=pil_frames[1:], duration=int(1000/max(1,args.gif_fps)), loop=0, disposal=2)
+        print(f"Saved GIF to {out_gif} ({len(pil_frames)} frames)")
+
+# Optional: export Hy GIF
+if args.gif_hy and gif_hy_frames:
+    x_mm_t = x.squeeze().detach().cpu() * 1e3
+    y_mm_t = y.squeeze().detach().cpu() * 1e3
+    extent = [float(x_mm_t.min().item()), float(x_mm_t.max().item()), float(y_mm_t.min().item()), float(y_mm_t.max().item())]
+
+    stack_hy = torch.stack([torch.nan_to_num(f) for f in gif_hy_frames], dim=0)
+    vmin_hy, vmax_hy, _ = _compute_scale(stack_hy, args.norm, percent_pair)
+    if args.norm == 'sym':
+        vmax_abs = max(abs(vmin_hy), abs(vmax_hy), 1e-12)
+        vmin_hy, vmax_hy = -vmax_abs, vmax_abs
+
+    pil_frames = []
+    for ft in gif_hy_frames:
+        img = _render_tensor_to_pil(torch.nan_to_num(ft), vmin_hy, vmax_hy, extent, args.cmap, None)
+        if img is not None:
+            pil_frames.append(img)
+    if pil_frames:
+        out_gif = args.gif_hy_path
+        if not os.path.isabs(out_gif):
+            out_gif = os.path.join(proj_root, out_gif)
+        pil_frames[0].save(out_gif, save_all=True, append_images=pil_frames[1:], duration=int(1000/max(1,args.gif_fps)), loop=0, disposal=2)
+        print(f"Saved GIF to {out_gif} ({len(pil_frames)} frames)")
