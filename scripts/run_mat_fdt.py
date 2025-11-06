@@ -2,10 +2,12 @@ import sys
 import os
 from glob import glob
 import torch
+torch.set_default_dtype(torch.float64)
 import math
 import argparse
 import matplotlib.pyplot as plt
 from io import BytesIO
+import csv
 
 proj_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 src_path = os.path.join(proj_root, "src")
@@ -22,7 +24,7 @@ def load_mat_to_torch(path):
         for k, v in raw.items():
             try:
                 # convert numeric arrays to torch tensors
-                t = torch.as_tensor(v, dtype=torch.float32)
+                t = torch.as_tensor(v, dtype=torch.get_default_dtype())
                 out[k] = t
             except Exception:
                 out[k] = v
@@ -32,7 +34,7 @@ def load_mat_to_torch(path):
         with h5py.File(path, 'r') as f:
             for k in f.keys():
                 try:
-                    out[k] = torch.as_tensor(f[k][()], dtype=torch.float32)
+                    out[k] = torch.as_tensor(f[k][()], dtype=torch.get_default_dtype())
                 except Exception:
                     out[k] = f[k][()]
         return out
@@ -58,6 +60,11 @@ parser.add_argument('--gif', action='store_true', help='Export an Ez animation G
 parser.add_argument('--gif-path', type=str, default='Ez_anim.gif', help='Output path for GIF (relative to project root if not absolute)')
 parser.add_argument('--gif-every', type=int, default=1, help='Capture every k steps')
 parser.add_argument('--gif-fps', type=int, default=15, help='Frames per second for GIF')
+parser.add_argument('--compare-gt', action='store_true', help='Compare vs. ground-truth time series from .mat if available')
+parser.add_argument('--gt-offset', type=int, default=0, help='Align predicted step n to GT index n+offset')
+parser.add_argument('--save-diff', action='store_true', help='Save final-frame difference heatmaps vs GT')
+parser.add_argument('--metrics-out', type=str, default='metrics_vs_time.csv', help='CSV file for step-wise metrics')
+parser.add_argument('--rel-only', action='store_true', help='Only compute/print CSV relative errors |pred-GT|/|GT| (no dB/MSE/MAE)')
 parser.add_argument('--gif-hx', action='store_true', help='Also export an Hx GIF')
 parser.add_argument('--gif-hy', action='store_true', help='Also export an Hy GIF')
 parser.add_argument('--gif-hx-path', type=str, default='Hx_anim.gif', help='Output path for Hx GIF (relative to project root if not absolute)')
@@ -105,6 +112,17 @@ else:
     Ez0 = Ez
     nt = int(t.numel()) if (torch.is_tensor(t)) else (int(len(t)) if t is not None else 1)
 
+# GT stacks if available for comparison (expect [nx,ny,nt])
+Ez_gt = Ez if (isinstance(Ez, torch.Tensor) and Ez.dim() == 3) else None
+Hx_gt = Hx if (isinstance(Hx, torch.Tensor) and Hx is not None and isinstance(Ez, torch.Tensor) and Ez.dim() == 3 and isinstance(Hx, torch.Tensor) and Hx.dim() == 3) else None
+Hy_gt = Hy if (isinstance(Hy, torch.Tensor) and Hy is not None and isinstance(Ez, torch.Tensor) and Ez.dim() == 3 and isinstance(Hy, torch.Tensor) and Hy.dim() == 3) else None
+
+def _psnr2d(pred: torch.Tensor, gt: torch.Tensor, eps: float = 1e-12) -> float:
+    # pred, gt: [nx,ny]
+    mse = torch.mean((pred - gt) ** 2)
+    dyn = torch.max(torch.abs(gt)) + eps
+    return float(20.0 * torch.log10(dyn / (torch.sqrt(mse + eps))) .item())
+
 # determine grid and spacing
 if x is not None and y is not None:
     # x,y expected as tensors or array-like; convert to 1D torch tensors
@@ -133,20 +151,20 @@ print(f"grid: nx={nx}, nz={nz}, dx={dx:.3e}, dz={dz:.3e}")
 # material maps (defaults if missing)
 eps0 = 8.854187817e-12
 mu0 = 4*math.pi*1e-7
-eps_map = get("eps") if get("eps") is not None else torch.full((nx, nz), eps0, dtype=torch.float32)
-mu_map  = get("mu")  if get("mu")  is not None else torch.full((nx, nz), mu0, dtype=torch.float32)
-sigma_map = get("sigma") if get("sigma") is not None else torch.zeros((nx, nz), dtype=torch.float32)
+eps_map = get("eps") if get("eps") is not None else torch.full((nx, nz), eps0, dtype=torch.get_default_dtype())
+mu_map  = get("mu")  if get("mu")  is not None else torch.full((nx, nz), mu0, dtype=torch.get_default_dtype())
+sigma_map = get("sigma") if get("sigma") is not None else torch.zeros((nx, nz), dtype=torch.get_default_dtype())
 
 # optional uniform damping (S/m), set >0 to stabilize if you see blow-up
 if float(args.sigma_uniform) != 0.0:
     sigma_map = sigma_map + float(args.sigma_uniform)
 
-# convert loaded arrays to torch tensors and ensure float32
+# convert loaded arrays to torch tensors and ensure default dtype
 device = torch.device("cpu")
 if torch.is_tensor(Ez0):
-    Ez0_t = Ez0.to(torch.float32).to(device)
+    Ez0_t = Ez0.to(torch.get_default_dtype()).to(device)
 else:
-    Ez0_t = torch.as_tensor(Ez0, dtype=torch.float32, device=device)
+    Ez0_t = torch.as_tensor(Ez0, dtype=torch.get_default_dtype(), device=device)
 Ez_t = Ez0_t.unsqueeze(0).unsqueeze(0).contiguous()
 Hx_t = torch.zeros_like(Ez_t)
 Hy_t = torch.zeros_like(Ez_t)
@@ -154,7 +172,7 @@ if Hy is not None:
     if torch.is_tensor(Hy):
         Hy_arr = Hy
     else:
-        Hy_arr = torch.as_tensor(Hy, dtype=torch.float32)
+        Hy_arr = torch.as_tensor(Hy, dtype=torch.get_default_dtype())
     if Hy_arr.dim() == 3:
         Hy_arr = Hy_arr[..., 0]
     Hy_t = Hy_arr.to(device).unsqueeze(0).unsqueeze(0).contiguous()
@@ -162,14 +180,14 @@ if Hx is not None:
     if torch.is_tensor(Hx):
         Hx_arr = Hx
     else:
-        Hx_arr = torch.as_tensor(Hx, dtype=torch.float32)
+        Hx_arr = torch.as_tensor(Hx, dtype=torch.get_default_dtype())
     if Hx_arr.dim() == 3:
         Hx_arr = Hx_arr[..., 0]
     Hx_t = Hx_arr.to(device).unsqueeze(0).unsqueeze(0).contiguous()
 
-eps_t = eps_map.to(torch.float32).to(device).unsqueeze(0).unsqueeze(0).contiguous()
-mu_t  = mu_map.to(torch.float32).to(device).unsqueeze(0).unsqueeze(0).contiguous()
-sigma_t = sigma_map.to(torch.float32).to(device).unsqueeze(0).unsqueeze(0).contiguous()
+eps_t = eps_map.to(torch.get_default_dtype()).to(device).unsqueeze(0).unsqueeze(0).contiguous()
+mu_t  = mu_map.to(torch.get_default_dtype()).to(device).unsqueeze(0).unsqueeze(0).contiguous()
+sigma_t = sigma_map.to(torch.get_default_dtype()).to(device).unsqueeze(0).unsqueeze(0).contiguous()
 
 # CFL dt
 c0 = 299792458.0
@@ -237,6 +255,7 @@ snapshots = []
 gif_frames = []          # Ez frames
 gif_hx_frames = []       # Hx frames
 gif_hy_frames = []       # Hy frames
+metrics_rows = []        # per-step metrics vs GT
 
 # source injection strategy
 cx, cy = nx//2, nz//2
@@ -276,13 +295,87 @@ for n in range(steps):
         nonzero = int((arr_cur_t != 0).sum().item())
         print(f"step {n}: min={nmin:.3e} max={nmax:.3e} mean={nmean:.3e} nonzero={nonzero}")
     # collect GIF frames
-    if (n % max(1, int(args.gif_every)) == 0):
-        if args.gif:
-            gif_frames.append(arr_cur_t.clone())
-        if args.gif_hx:
-            gif_hx_frames.append(Hx_t[0,0].detach().cpu().clone())
-        if args.gif_hy:
-            gif_hy_frames.append(Hy_t[0,0].detach().cpu().clone())
+    capture = (n % max(1, int(args.gif_every)) == 0)
+    if capture and args.gif:
+        gif_frames.append(arr_cur_t.clone())
+    if capture and args.gif_hx:
+        gif_hx_frames.append(Hx_t[0,0].detach().cpu().clone())
+    if capture and args.gif_hy:
+        gif_hy_frames.append(Hy_t[0,0].detach().cpu().clone())
+
+    # metrics vs GT per step
+    if args.compare_gt and Ez_gt is not None:
+        gt_idx = max(0, min(int(n + args.gt_offset), int(Ez_gt.shape[2]) - 1))
+        ez_gt_t = Ez_gt[:, :, gt_idx]
+        ez_gt = (ez_gt_t if torch.is_tensor(ez_gt_t) else torch.as_tensor(ez_gt_t)).to(arr_cur_t.dtype)
+        if tuple(ez_gt.shape) == tuple(arr_cur_t.shape):
+            if not args.rel_only:
+                mse_e = float(torch.mean((arr_cur_t - ez_gt) ** 2).item())
+                mae_e = float(torch.mean(torch.abs(arr_cur_t - ez_gt)).item())
+                psnr_e = _psnr2d(arr_cur_t, ez_gt)
+            # relative error metrics
+            eps_rel = torch.finfo(arr_cur_t.dtype).eps * 10.0
+            rel_e = torch.abs(arr_cur_t - ez_gt) / (torch.abs(ez_gt) + eps_rel)
+            rel_mean_e = float(torch.mean(rel_e).item())
+            rel_max_e = float(torch.max(rel_e).item())
+        else:
+            if not args.rel_only:
+                mse_e = mae_e = psnr_e = float('nan')
+            rel_mean_e = rel_max_e = float('nan')
+
+        def _metrics_H(pred_field: torch.Tensor, gt_3d: torch.Tensor):
+            try:
+                pred2d = pred_field[0, 0].detach().cpu()
+                gt2d = gt_3d[:, :, gt_idx].to(pred2d.dtype)
+                if tuple(gt2d.shape) != tuple(pred2d.shape):
+                    return float('nan'), float('nan'), float('nan'), float('nan'), float('nan')
+                if not args.rel_only:
+                    mse = float(torch.mean((pred2d - gt2d) ** 2).item())
+                    mae = float(torch.mean(torch.abs(pred2d - gt2d)).item())
+                    psn = _psnr2d(pred2d, gt2d)
+                eps_rel_h = torch.finfo(pred2d.dtype).eps * 10.0
+                rel = torch.abs(pred2d - gt2d) / (torch.abs(gt2d) + eps_rel_h)
+                rel_m = float(torch.mean(rel).item())
+                rel_M = float(torch.max(rel).item())
+                if not args.rel_only:
+                    return mse, mae, psn, rel_m, rel_M
+                else:
+                    return float('nan'), float('nan'), float('nan'), rel_m, rel_M
+            except Exception:
+                return float('nan'), float('nan'), float('nan'), float('nan'), float('nan')
+
+        if Hx_gt is not None:
+            mse_hx, mae_hx, psnr_hx, rel_mean_hx, rel_max_hx = _metrics_H(Hx_t, Hx_gt)
+        else:
+            mse_hx = mae_hx = psnr_hx = rel_mean_hx = rel_max_hx = float('nan')
+        if Hy_gt is not None:
+            mse_hy, mae_hy, psnr_hy, rel_mean_hy, rel_max_hy = _metrics_H(Hy_t, Hy_gt)
+        else:
+            mse_hy = mae_hy = psnr_hy = rel_mean_hy = rel_max_hy = float('nan')
+
+        if n % max(1, steps//10) == 0:
+            if not args.rel_only:
+                print(f"  GT@{gt_idx}: Ez MSE={mse_e:.3e} MAE={mae_e:.3e} PSNR={psnr_e:.2f}dB RelMean={rel_mean_e:.3e}")
+            else:
+                print(f"  GT@{gt_idx}: Ez RelMean={rel_mean_e:.3e}")
+
+        if not args.rel_only:
+            metrics_rows.append({
+                    'step': int(n),
+                    'mse_Ez': mse_e, 'mae_Ez': mae_e, 'psnr_Ez': psnr_e,
+                    'rel_mean_Ez': rel_mean_e,
+                    'mse_Hx': mse_hx, 'mae_Hx': mae_hx, 'psnr_Hx': psnr_hx,
+                    'rel_mean_Hx': rel_mean_hx,
+                    'mse_Hy': mse_hy, 'mae_Hy': mae_hy, 'psnr_Hy': psnr_hy,
+                    'rel_mean_Hy': rel_mean_hy,
+                })
+        else:
+            metrics_rows.append({
+                    'step': int(n),
+                    'rel_mean_Ez': rel_mean_e,
+                    'rel_mean_Hx': rel_mean_hx,
+                    'rel_mean_Hy': rel_mean_hy,
+                })
 
 # final stats (torch)
 arr_t = Ez_t[0,0].detach().cpu()
@@ -476,6 +569,34 @@ if args.gif and gif_frames:
         
         pil_frames[0].save(out_gif, save_all=True, append_images=pil_frames[1:], duration=int(1000/max(1,args.gif_fps)), loop=0, disposal=2)
         print(f"Saved GIF to {out_gif} ({len(pil_frames)} frames)")
+
+# Write metrics CSV
+if args.compare_gt and metrics_rows:
+    out_csv = args.metrics_out if os.path.isabs(args.metrics_out) else os.path.join(proj_root, args.metrics_out)
+    with open(out_csv, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=list(metrics_rows[0].keys()))
+        writer.writeheader()
+        for r in metrics_rows:
+            writer.writerow(r)
+    print(f"Saved metrics to {out_csv}")
+
+# Save final diffs
+def _wrap2(ft: torch.Tensor) -> torch.Tensor:
+    return ft.unsqueeze(0).unsqueeze(0)
+
+if args.save_diff and Ez_gt is not None:
+    final_idx = max(0, min(int(steps - 1 + args.gt_offset), int(Ez_gt.shape[2]) - 1))
+    ez_gt_final = Ez_gt[:, :, final_idx].to(arr_t.dtype)
+    if tuple(ez_gt_final.shape) == tuple(arr_t.shape):
+        plot_field(_wrap2(arr_t - ez_gt_final), 'Ez_diff', os.path.join(proj_root, 'Ez_diff.png'), mode='sym', cmap=args.cmap, unit_label=args.unitE)
+    if Hx_gt is not None:
+        hx_gt_final = Hx_gt[:, :, final_idx].to(hx_t.dtype)
+        if tuple(hx_gt_final.shape) == tuple(hx_t.shape):
+            plot_field(_wrap2(hx_t - hx_gt_final), 'Hx_diff', os.path.join(proj_root, 'Hx_diff.png'), mode='sym', cmap=args.cmap, unit_label=args.unitH)
+    if Hy_gt is not None:
+        hy_gt_final = Hy_gt[:, :, final_idx].to(hy_t.dtype)
+        if tuple(hy_gt_final.shape) == tuple(hy_t.shape):
+            plot_field(_wrap2(hy_t - hy_gt_final), 'Hy_diff', os.path.join(proj_root, 'Hy_diff.png'), mode='sym', cmap=args.cmap, unit_label=args.unitH)
 
 # Optional: export Hx GIF
 if args.gif_hx and gif_hx_frames:
