@@ -65,6 +65,8 @@ parser.add_argument('--gt-offset', type=int, default=0, help='Align predicted st
 parser.add_argument('--save-diff', action='store_true', help='Save final-frame difference heatmaps vs GT')
 parser.add_argument('--metrics-out', type=str, default='metrics_vs_time.csv', help='CSV file for step-wise metrics')
 parser.add_argument('--rel-only', action='store_true', help='Only compute/print CSV relative errors |pred-GT|/|GT| (no dB/MSE/MAE)')
+parser.add_argument('--use-gt-dt', action='store_true', help='Use mean(diff(t)) from .mat as dt to align time with GT')
+parser.add_argument('--init-H-from-gt', action='store_true', help='Initialize Hx/Hy from GT frame 0 instead of zeros')
 parser.add_argument('--gif-hx', action='store_true', help='Also export an Hx GIF')
 parser.add_argument('--gif-hy', action='store_true', help='Also export an Hy GIF')
 parser.add_argument('--gif-hx-path', type=str, default='Hx_anim.gif', help='Output path for Hx GIF (relative to project root if not absolute)')
@@ -104,6 +106,32 @@ x = get("x")
 y = get("y")
 t = get("t")
 idx_bc = get("idx_bc")
+xx_2d = get("xx_2d")
+yy_2d = get("yy_2d")
+
+# Determine if we need to transpose: check if xx_2d[i,j] corresponds to x[i] or x[j]
+need_transpose = False
+if xx_2d is not None and x is not None:
+    x_1d = x.squeeze()
+    # Check if xx_2d varies along axis 0 (rows) or axis 1 (cols)
+    # If xx_2d[i,:] are all same and xx_2d[:,j] varies with j, then xx_2d[i,j] = x[j] → col is x
+    # Which means data is [row=y, col=x], need transpose to [x,y]
+    if xx_2d.shape[0] > 1 and xx_2d.shape[1] > 1:
+        row_var = float(torch.std(xx_2d[0, :]).item())  # variation along a row
+        col_var = float(torch.std(xx_2d[:, 0]).item())  # variation along a column
+        if row_var > col_var * 10:  # x varies along columns
+            need_transpose = True
+            print(f"Detected MATLAB [row=y, col=x] format (row_var={row_var:.3e} >> col_var={col_var:.3e})")
+        else:
+            print(f"Detected Python [row=x, col=y] format (col_var={col_var:.3e} >= row_var={row_var:.3e})")
+
+if isinstance(Ez, torch.Tensor) and Ez.dim() == 3 and need_transpose:
+    print(f"Transposing spatial dimensions: {Ez.shape} [y,x,t] -> [x,y,t]")
+    Ez = Ez.transpose(0, 1).contiguous()
+    if isinstance(Hx, torch.Tensor) and Hx.dim() == 3:
+        Hx = Hx.transpose(0, 1).contiguous()
+    if isinstance(Hy, torch.Tensor) and Hy.dim() == 3:
+        Hy = Hy.transpose(0, 1).contiguous()
 
 if isinstance(Ez, torch.Tensor) and Ez.dim() == 3:
     nt = Ez.shape[2]
@@ -166,24 +194,27 @@ if torch.is_tensor(Ez0):
 else:
     Ez0_t = torch.as_tensor(Ez0, dtype=torch.get_default_dtype(), device=device)
 Ez_t = Ez0_t.unsqueeze(0).unsqueeze(0).contiguous()
-Hx_t = torch.zeros_like(Ez_t)
-Hy_t = torch.zeros_like(Ez_t)
-if Hy is not None:
-    if torch.is_tensor(Hy):
-        Hy_arr = Hy
+
+# Initialize H: for proper leapfrog, we need H at t=-1/2
+# Option 1: Start from zeros (physically correct for initial rest state)
+# Option 2: Use GT frame 0 as initial condition (better alignment with GT comparison)
+if args.init_H_from_gt:
+    if Hx is not None and torch.is_tensor(Hx) and Hx.dim() == 3:
+        Hx_arr = Hx[..., 0].to(torch.get_default_dtype())
+        Hx_t = Hx_arr.to(device).unsqueeze(0).unsqueeze(0).contiguous()
+        print("Initialized Hx from GT frame 0")
     else:
-        Hy_arr = torch.as_tensor(Hy, dtype=torch.get_default_dtype())
-    if Hy_arr.dim() == 3:
-        Hy_arr = Hy_arr[..., 0]
-    Hy_t = Hy_arr.to(device).unsqueeze(0).unsqueeze(0).contiguous()
-if Hx is not None:
-    if torch.is_tensor(Hx):
-        Hx_arr = Hx
+        Hx_t = torch.zeros_like(Ez_t)
+    
+    if Hy is not None and torch.is_tensor(Hy) and Hy.dim() == 3:
+        Hy_arr = Hy[..., 0].to(torch.get_default_dtype())
+        Hy_t = Hy_arr.to(device).unsqueeze(0).unsqueeze(0).contiguous()
+        print("Initialized Hy from GT frame 0")
     else:
-        Hx_arr = torch.as_tensor(Hx, dtype=torch.get_default_dtype())
-    if Hx_arr.dim() == 3:
-        Hx_arr = Hx_arr[..., 0]
-    Hx_t = Hx_arr.to(device).unsqueeze(0).unsqueeze(0).contiguous()
+        Hy_t = torch.zeros_like(Ez_t)
+else:
+    Hx_t = torch.zeros_like(Ez_t)
+    Hy_t = torch.zeros_like(Ez_t)
 
 eps_t = eps_map.to(torch.get_default_dtype()).to(device).unsqueeze(0).unsqueeze(0).contiguous()
 mu_t  = mu_map.to(torch.get_default_dtype()).to(device).unsqueeze(0).unsqueeze(0).contiguous()
@@ -193,6 +224,18 @@ sigma_t = sigma_map.to(torch.get_default_dtype()).to(device).unsqueeze(0).unsque
 c0 = 299792458.0
 # add a CFL safety factor to avoid blow-up on non-staggered discretization
 dt = float(args.cfl_scale) / (c0 * math.sqrt((1/dx**2) + (1/dz**2)))
+if args.use_gt_dt and (t is not None):
+    try:
+        t1 = t.squeeze()
+        if not torch.is_tensor(t1):
+            t1 = torch.as_tensor(t1, dtype=torch.get_default_dtype())
+        if int(t1.numel()) >= 2:
+            dt_gt = float(torch.mean(t1[1:] - t1[:-1]).item())
+            if dt_gt > 0:
+                dt = dt_gt
+                print(f"Overriding dt from GT: dt = {dt}")
+    except Exception:
+        pass
 print("dt =", dt)
 
 if args.backend == 'dense':
@@ -236,9 +279,8 @@ def enforce_dirichlet_indices(field_tensor, idx_bc, nx, nz):
             field_tensor[0, 0, int(r), int(c)] = 0.0
     return field_tensor
 
+# Enforce PEC-like boundary only on Ez (match typical TMz cavity); avoid clamping H to reduce mismatch
 Ez_t = enforce_dirichlet_indices(Ez_t, idx_bc, nx, nz)
-Hx_t = enforce_dirichlet_indices(Hx_t, None, nx, nz)
-Hy_t = enforce_dirichlet_indices(Hy_t, None, nx, nz)
 
 # time stepping
 # choose steps from Ez time dim if present, else from t, else default
@@ -265,6 +307,30 @@ if args.source == 'auto':
     src_mode = 'gauss' if initial_peak < 1e-9 else 'none'
 freq_hz = float(args.src_freq_ghz) * 1e9
 print(f"Source mode: {src_mode} (initial |Ez| max={initial_peak:.3e}) at center=({cx},{cy})")
+
+# Print initial condition errors for diagnostics
+if args.compare_gt and Ez_gt is not None:
+    ez_init = Ez_t[0,0].detach().cpu()
+    ez_gt_0 = Ez_gt[:,:,0].to(ez_init.dtype)
+    if tuple(ez_gt_0.shape) == tuple(ez_init.shape):
+        eps_rel = torch.finfo(ez_init.dtype).eps * 10.0
+        rel_ez_init = torch.abs(ez_init - ez_gt_0) / (torch.abs(ez_gt_0) + eps_rel)
+        print(f"Initial Ez error: RelMean={float(torch.mean(rel_ez_init).item()):.3e}")
+    
+    if Hx_gt is not None:
+        hx_init = Hx_t[0,0].detach().cpu()
+        hx_gt_0 = Hx_gt[:,:,0].to(hx_init.dtype)
+        if tuple(hx_gt_0.shape) == tuple(hx_init.shape):
+            rel_hx_init = torch.abs(hx_init - hx_gt_0) / (torch.abs(hx_gt_0) + eps_rel)
+            print(f"Initial Hx error: RelMean={float(torch.mean(rel_hx_init).item()):.3e}")
+    
+    if Hy_gt is not None:
+        hy_init = Hy_t[0,0].detach().cpu()
+        hy_gt_0 = Hy_gt[:,:,0].to(hy_init.dtype)
+        if tuple(hy_gt_0.shape) == tuple(hy_init.shape):
+            rel_hy_init = torch.abs(hy_init - hy_gt_0) / (torch.abs(hy_gt_0) + eps_rel)
+            print(f"Initial Hy error: RelMean={float(torch.mean(rel_hy_init).item()):.3e}")
+
 for n in range(steps):
     # Optional source on Ez
     if src_mode == 'gauss':
@@ -279,8 +345,6 @@ for n in range(steps):
 
     Ez_t, Hx_t, Hy_t = model.step(Ez_t, Hx_t, Hy_t)
     Ez_t = enforce_dirichlet_indices(Ez_t, idx_bc, nx, nz)
-    Hx_t = enforce_dirichlet_indices(Hx_t, None, nx, nz)
-    Hy_t = enforce_dirichlet_indices(Hy_t, None, nx, nz)
     # early break on numerical issues
     if (not torch.isfinite(Ez_t).all()) or (not torch.isfinite(Hx_t).all()) or (not torch.isfinite(Hy_t).all()):
         print(f"break at step {n}: non-finite values detected")
