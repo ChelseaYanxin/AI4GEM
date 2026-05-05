@@ -18,6 +18,22 @@ ENV/
 # Jupyter
 .ipynb_checkpoints/
 
+# Large datasets / model artifacts (keep out of git; use scripts or LFS if needed)
+*.mat
+*.pt
+*.pth
+*.ckpt
+*.npz
+*.npy
+
+# Generated media / logs (reproducible)
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.mp4
+*.csv
+
 # Build artifacts
 build/
 dist/
