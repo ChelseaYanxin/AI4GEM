@@ -20,10 +20,6 @@ floattype = np.float64
 from scipy.constants import mu_0 as m0
 from scipy.constants import epsilon_0 as e0
 
-# ============================================================================
-# Setup (same as original code)
-# ============================================================================
-
 c0 = 2.99792458e8
 
 # Grid parameters
@@ -108,9 +104,6 @@ Hz_save = np.zeros((nx, ny, nz + 1, n_clean), dtype=floattype)
 print("\nStarting FDTD simulation...")
 print(f"Phase 1: Warmup with source (steps 1-{SOURCE_END_STEP})")
 
-# ============================================================================
-# Main FDTD Loop
-# ============================================================================
 
 for n in range(1, nmax + 1):
     
@@ -170,9 +163,7 @@ for n in range(1, nmax + 1):
 
 print("\nSimulation complete!")
 
-# ============================================================================
 # Save data to .mat file
-# ============================================================================
 
 output_dir = '/Users/zyanxin/Documents/code/GEM_N/data'
 output_file = os.path.join(output_dir, 'FDTD_3D_cavity_clean_data.mat')

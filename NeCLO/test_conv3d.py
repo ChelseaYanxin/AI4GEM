@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Fixed Conv3D-based 3D FDTD with Final Step Visualization.
+Conv3D-based NeCLO.
 """
 
 import os
@@ -107,8 +107,6 @@ slice_Hz = (slice(None), slice(None), slice(0,nx), slice(0,ny), slice(0,nz+1))
 
 max_abs_error = -1.0
 
-print("Starting FIXED conv3d run...")
-
 for n in range(1, nmax + 1):
     
     # --- E Updates ---
@@ -194,9 +192,10 @@ if compare_ref:
     Hy_gt = Hy_ref_np[:, :, k_slice, ref_idx]
     Ez_gt = Ez_ref_np[:, :, k_slice, ref_idx]
 
-# Layout: 3 Rows (Hx, Hy, Ez), 2 Columns (Ground Truth, GEM) if ref exists
-rows, cols = 3, (2 if compare_ref else 1)
-fig, axes = plt.subplots(rows, cols, figsize=(10, 12))
+#rows, cols = 3, (2 if compare_ref else 1)
+#fig, axes = plt.subplots(rows, cols, figsize=(10, 12))
+rows, cols = 1, (2 if compare_ref else 1)
+fig, axes = plt.subplots(rows, cols, figsize=(8, 4))
 
 # Helper function to plot heatmap
 def plot_field(ax, data, title, cmap='jet'):
@@ -209,20 +208,20 @@ def plot_field(ax, data, title, cmap='jet'):
 if compare_ref:
     # Row 1: Hx
     plot_field(axes[0, 0], Hx_gt, "Hx Ground Truth")
-    plot_field(axes[0, 1], Hx_sim, "Hx GEM (Conv3D)")
+    plot_field(axes[0, 1], Hx_sim, "Hx NeCLO")
     
     # Row 2: Hy
     plot_field(axes[1, 0], Hy_gt, "Hy Ground Truth")
-    plot_field(axes[1, 1], Hy_sim, "Hy GEM (Conv3D)")
+    plot_field(axes[1, 1], Hy_sim, "Hy NeCLO")
     
     # Row 3: Ez
     plot_field(axes[2, 0], Ez_gt, "Ez Ground Truth")
-    plot_field(axes[2, 1], Ez_sim, "Ez GEM (Conv3D)")
+    plot_field(axes[2, 1], Ez_sim, "Ez NeCLO")
 
 else:
-    plot_field(axes[0], Hx_sim, "Hx GEM (Conv3D)")
-    plot_field(axes[1], Hy_sim, "Hy GEM (Conv3D)")
-    plot_field(axes[2], Ez_sim, "Ez GEM (Conv3D)")
+    plot_field(axes[0], Hx_sim, "Hx NeCLO")
+    plot_field(axes[1], Hy_sim, "Hy NeCLO")
+    plot_field(axes[2], Ez_sim, "Ez NeCLO")
 
 plt.tight_layout()
 plt.show()

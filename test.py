@@ -1,83 +1,134 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+STABLE & FAST 3D FDTD (CPU Slicing)
+Fixes:
+1. Corrected spatial indexing (using ':-1' instead of '1:') to match Yee Grid.
+2. Prevents numerical explosion (NaN) by respecting causality.
+"""
 
-import numpy as np
-from scipy.io import loadmat
-from scipy.constants import mu_0 as m0, epsilon_0 as e0, speed_of_light as c0
 import time
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+from scipy.constants import mu_0 as m0, epsilon_0 as e0
 
-dx = 1.0e-3
-dy = 1.0e-3
-dt = 0.99 / (c0 * (1/dx**2 + 1/dy**2)**0.5)
+# ==========================================
+# 1. Setup
+# ==========================================
+dtype_torch = torch.float64
+device = torch.device("cpu") 
 
-nx = 100
-ny = 100
+print(f"Running on: {device} (Stable Slicing)")
+# Grid
+nx, ny, nz = 20, 20, 20
+dx, dy, dz = 2e-3, 2e-3, 2e-3
+shape_max = (1, 3, nx + 1, ny + 1, nz + 1)
 
-floattype = np.float64
+# Source
+Is, Js, Ks = 9, 9, 9 
 
-mat = loadmat("data/data_FDTD_2D_cavity/2D_TM_all_processed_jiequ_200_300.mat")
+# Time
+nmax = 500
+c0 = 2.99792458e8
+# CFL Condition Check
+dt = 0.99 / (c0 * np.sqrt(1.0/(dx*dx) + 1.0/(dy*dy) + 1.0/(dz*dz)))
 
-Ez_gt = mat["Ez"]       # shape = (nx+1, ny+1, T)
-Hx_gt = mat["Hx"]       # shape = (nx+1, ny,   T)
-Hy_gt = mat["Hy"]       # shape = (nx,   ny+1, T)
+# Material
+sigma = 1.0; eps_r = 1.0
+EA = (e0 * eps_r / dt) + 0.5 * sigma
+EB = (e0 * eps_r / dt) - 0.5 * sigma
+CA = EB / EA
+CB = 1.0 / (EA * dx) 
+C_H = dt / (m0 * dx)
 
-T = Ez_gt.shape[2]
-nsteps = T - 1  # use full GT sequence
+CA = torch.tensor(CA, dtype=dtype_torch, device=device)
+CB = torch.tensor(CB, dtype=dtype_torch, device=device)
+C_H = torch.tensor(C_H, dtype=dtype_torch, device=device)
 
-#t = mat["t"].ravel()
-#dt = t[1] - t[0]
+E = torch.zeros(shape_max, dtype=dtype_torch, device=device)
+H = torch.zeros(shape_max, dtype=dtype_torch, device=device)
 
-Ez = Ez_gt[:, :, 0].copy()
-Hx = Hx_gt[:, :, 0].copy()
-Hy = Hy_gt[:, :, 0].copy()
+# Source
+t = torch.arange(1, nmax + 2, dtype=dtype_torch, device=device) * dt
+rtau = 50.0e-12; tau = rtau / dt; ndelay = 3 * tau; srcconst = -dt * (3.0e11)
+source = srcconst * ((t/dt) - ndelay) * torch.exp(-(((t/dt) - ndelay)**2 / (tau**2)))
 
-eps = np.ones((nx+1, ny+1)) * e0
-sig = np.zeros((nx+1, ny+1))
+# ==========================================
+# 2. Main Loop (Stable)
+# ==========================================
+print(f"Starting Simulation ({nmax} steps)...")
+t_start = time.time()
 
-CA_Ez = (1 - sig * dt / (2 * eps)) / (1 + sig * dt / (2 * eps))
-CB_Ez = (dt / eps) / (1 + sig * dt / (2 * eps))
+with torch.no_grad():
+    for n in range(nmax):
+        
+        # --- Update H ---
 
-DA = 1.0
-DB = dt / m0
+        # 1. Hx (位于 y+0.5, z+0.5) -> 需要 dEz/dy 和 dEy/dz
+        # dEz_dy: 沿Y求导(Y少1), X/Z 保持全长
+        dEz_dy = E[:, 2, :, 1:, :] - E[:, 2, :, :-1, :] 
+        # dEy_dz: 沿Z求导(Z少1), X/Y 保持全长
+        dEy_dz = E[:, 1, :, :, 1:] - E[:, 1, :, :, :-1]
+        
+        # 对齐：X取 [:-1] (因为 Hx 只需要 nx 个), Y取与 dEz_dy 一致, Z取与 dEy_dz 一致
+        # dEz_dy 缺Y，需切 Z[:-1]
+        # dEy_dz 缺Z，需切 Y[:-1]
+        term1 = dEz_dy[..., :-1]    # Shape: (B, X, Y_reduced, Z_reduced)
+        term2 = dEy_dz[..., :-1, :] # Shape: (B, X, Y_reduced, Z_reduced)
+        
+        H[:, 0, :, :-1, :-1] -= C_H * (term1 - term2)
 
-den_hx = np.ones(nx) / dy
-den_hy = np.ones(ny) / dy
-den_ex = np.ones(nx) / dx
-den_ey = np.ones(ny) / dy
+        # 2. Hy (位于 x+0.5, z+0.5) -> 需要 dEx/dz - dEz/dx
+        dEx_dz = E[:, 0, :, :, 1:] - E[:, 0, :, :, :-1]
+        dEz_dx = E[:, 2, 1:, :, :] - E[:, 2, :-1, :, :]
+        
+        term1 = dEx_dz[..., :-1, :, :] # Cut X to match dEz_dx
+        term2 = dEz_dx[..., :-1]       # Cut Z to match dEx_dz
+        
+        H[:, 1, :-1, :, :-1] -= C_H * (term1 - term2)
 
-def rel_l2(pred, gt):
-    num = np.linalg.norm(pred - gt)
-    den = np.linalg.norm(gt)
-    return num / (den + 1e-12)
+        # 3. Hz (位于 x+0.5, y+0.5) -> 需要 dEy/dx - dEx/dy
+        dEy_dx = E[:, 1, 1:, :, :] - E[:, 1, :-1, :, :]
+        dEx_dy = E[:, 0, :, 1:, :] - E[:, 0, :, :-1, :]
+        
+        term1 = dEy_dx[..., :-1, :] # Cut Y to match dEx_dy
+        term2 = dEx_dy[..., :-1, :, :] # Cut X to match dEy_dx
+        
+        H[:, 2, :-1, :-1, :] -= C_H * (term1 - term2)
 
-print("Running FDTD TM without source...")
-print("Using GT[t=0] as initial condition")
-print("Total steps:", nsteps)
+        # --- Update E ---
+        # Ex
+        hz_term = H[:, 2, :, 1:-1, 1:-1] - H[:, 2, :, :-2, 1:-1]
+        hy_term = H[:, 1, :, 1:-1, 1:-1] - H[:, 1, :, 1:-1, :-2]
+        E[:, 0, :, 1:-1, 1:-1].mul_(CA).add_(hz_term - hy_term, alpha=CB)
 
-for n in range(1, nsteps) :
-    t0 = time.time()
+        # Ey
+        hx_term = H[:, 0, 1:-1, :, 1:-1] - H[:, 0, 1:-1, :, :-2]
+        hz_term = H[:, 2, 1:-1, :, 1:-1] - H[:, 2, :-2, :, 1:-1]
+        E[:, 1, 1:-1, :, 1:-1].mul_(CA).add_(hx_term - hz_term, alpha=CB)
 
-    # ---- update Hx, Hy ----
-    for i in range(0, nx):
-        for j in range(0, ny):
-            Hx[i, j] = DA * Hx[i, j] - DB * (Ez[i, j+1] - Ez[i, j]) * den_hy[j]
-            Hy[i, j] = DA * Hy[i, j] + DB * (Ez[i+1, j] - Ez[i, j]) * den_hx[i]
+        # Ez
+        hy_term = H[:, 1, 1:-1, 1:-1, :] - H[:, 1, :-2, 1:-1, :]
+        hx_term = H[:, 0, 1:-1, 1:-1, :] - H[:, 0, 1:-1, :-2, :]
+        E[:, 2, 1:-1, 1:-1, :].mul_(CA).add_(hy_term - hx_term, alpha=CB)
 
-    # ---- update Ez ----
-    for i in range(1, nx):
-        for j in range(1, ny):
-            Ez[i, j] = CA_Ez[i, j] * Ez[i, j] + CB_Ez[i, j] * (
-                (Hy[i, j] - Hy[i-1, j]) * den_ex[i] -
-                (Hx[i, j] - Hx[i, j-1]) * den_ey[j]
-            )
+        E[:, 2, Is, Js, Ks] += source[n]
+        
+        # Logging
+        if (n+1) % 50 == 0:
+            ez_val = E[0, 2, Is, Js, Ks].item()
+            rate = (n+1) / (time.time() - t_start)
+            print(f"Step {n+1}/{nmax}, Ez: {ez_val:.4e}, Rate: {rate:.1f} steps/s")
 
-    # ---- compare with GT ----
-    Ez_err = rel_l2(Ez, Ez_gt[:, :, n])
-    Hx_err = rel_l2(Hx, Hx_gt[:, :, n])
-    Hy_err = rel_l2(Hy, Hy_gt[:, :, n])
+total_time = time.time() - t_start
+print(f"\nFinal: {total_time:.4f} s | Rate: {nmax/total_time:.2f} steps/s")
 
-    elapsed = time.time() - t0
-
-    print(f"step={n:04d} | Ez_err={Ez_err:.6e} | Hx_err={Hx_err:.6e} | Hy_err={Hy_err:.6e} | dt={elapsed:.4f}s")
-
-print("Done.")
+mid_k = 9
+Ez_sim_slice = E[0, 2, :, :, mid_k].numpy()
+plt.figure(figsize=(6, 5))
+vmax = np.max(np.abs(Ez_sim_slice))
+plt.imshow(Ez_sim_slice.T, origin='lower', cmap='jet', vmin=-vmax, vmax=vmax)
+plt.title("Stable Slicing FDTD Result")
+plt.colorbar()
+plt.show()
